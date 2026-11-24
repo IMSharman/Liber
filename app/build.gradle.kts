@@ -23,9 +23,22 @@ android {
         }
     }
 
+    signingConfigs {
+        val ksPath = System.getenv("LIBER_KEYSTORE_PATH")
+        if (!ksPath.isNullOrBlank() && file(ksPath).exists()) {
+            create("release") {
+                storeFile = file(ksPath)
+                storePassword = System.getenv("LIBER_KEYSTORE_PASSWORD") ?: ""
+                keyAlias = System.getenv("LIBER_KEY_ALIAS") ?: "liber"
+                keyPassword = System.getenv("LIBER_KEY_PASSWORD") ?: ""
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

@@ -218,18 +218,11 @@ fun SettingsScreen(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Default.Shield, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Strict File Isolation & Privacy", style = MaterialTheme.typography.titleMedium)
+                            Text("Storage & Offline Mode", style = MaterialTheme.typography.titleMedium)
                         }
                         Text(
-                            text = "• Zero device-wide storage or photo permissions declared.\n" +
-                                "• Liber NEVER creates public `Covers` folders on your storage or touches images you didn't give it.\n" +
-                                "• Book covers are extracted strictly from inside book files into Liber's private app sandbox (`filesDir/covers`).",
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-
-                        Text(
-                            text = "Scoped Folders Linked: ${linkedFolders.size}  •  " +
-                                "Internal Covers: ${auditInfo.coverCount} (${formatFileSize(auditInfo.coverBytes)})  •  " +
+                            text = "Linked Folders: ${linkedFolders.size}  •  " +
+                                "Cached Covers: ${auditInfo.coverCount} (${formatFileSize(auditInfo.coverBytes)})  •  " +
                                 "Custom Fonts: ${auditInfo.customFontCount}",
                             style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.SemiBold
@@ -241,9 +234,9 @@ fun SettingsScreen(
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Text("Strict Offline-Only Mode", fontWeight = FontWeight.SemiBold)
+                                Text("Offline-Only Mode", fontWeight = FontWeight.SemiBold)
                                 Text(
-                                    "Blocks all network calls (Open Library lookup & WebDAV sync)",
+                                    "Disable online metadata lookup & WebDAV sync",
                                     style = MaterialTheme.typography.labelMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
