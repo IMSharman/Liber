@@ -855,12 +855,12 @@ private fun ScopedFoldersDirectoryList(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Shield, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        Icon(Icons.Default.Folder, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Scoped Folder Privacy", fontWeight = FontWeight.SemiBold)
+                        Text("Linked Book Folders", fontWeight = FontWeight.SemiBold)
                     }
                     Text(
-                        text = "Liber ONLY reads book files inside folders you explicitly link below. It never scans photos or creates external cover folders on your device.",
+                        text = "Link one or more folders on your device to keep your library synced with local book files.",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -911,7 +911,7 @@ private fun ScopedFoldersDirectoryList(
                         }
                     }
                     IconButton(onClick = { onUnlinkFolder(folder.treeUriString) }) {
-                        Icon(Icons.Default.Delete, contentDescription = "Revoke folder access")
+                        Icon(Icons.Default.Delete, contentDescription = "Unlink folder")
                     }
                 }
             }
@@ -946,7 +946,7 @@ private fun EmptyLibraryState(
             if (!hasAnyBooksInDb) {
                 Text("Welcome to Liber", style = MaterialTheme.typography.headlineMedium)
                 Text(
-                    text = "Import EPUB, PDF, CBZ/CBR, MOBI/AZW3, FB2, DOCX, TXT, or Markdown books. Liber never touches files or images you don't explicitly share with it.",
+                    text = "Import EPUB, PDF, CBZ/CBR, MOBI/AZW3, FB2, DOCX, TXT, or Markdown files—or link a book folder to get started.",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

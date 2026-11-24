@@ -35,8 +35,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,6 +48,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
@@ -148,6 +152,7 @@ fun ReflowableReaderView(
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
         val viewportWidthDp = maxWidth.value
         val viewportHeightDp = maxHeight.value
+        val viewportPxSize = IntSize(constraints.maxWidth, constraints.maxHeight)
 
         if (settings.scrollMode == ReaderScrollMode.PAGINATED_HORIZONTAL) {
             val pages = remember(
@@ -226,17 +231,21 @@ fun ReflowableReaderView(
                 }
             }
 
+            fun handleTapAtOffset(windowOffset: Offset) {
+                when (resolveTapZone(windowOffset, viewportPxSize, settings.tapZonePreset)) {
+                    TapZoneAction.PREVIOUS -> turnByDelta(-1)
+                    TapZoneAction.NEXT -> turnByDelta(+1)
+                    TapZoneAction.TOGGLE_HUD -> onToggleHud()
+                }
+            }
+
             HorizontalPager(
                 state = pagerState,
                 modifier = Modifier
                     .fillMaxSize()
-                    .pointerInput(settings.tapZonePreset) {
+                    .pointerInput(settings.tapZonePreset, viewportPxSize) {
                         detectTapGestures { offset ->
-                            when (resolveTapZone(offset, size, settings.tapZonePreset)) {
-                                TapZoneAction.PREVIOUS -> turnByDelta(-1)
-                                TapZoneAction.NEXT -> turnByDelta(+1)
-                                TapZoneAction.TOGGLE_HUD -> onToggleHud()
-                            }
+                            handleTapAtOffset(offset)
                         }
                     }
             ) { pageIdx ->
@@ -275,10 +284,7 @@ fun ReflowableReaderView(
                                     isDark = isDark,
                                     highlight = hl,
                                     isTtsActive = isTtsSpeaking,
-                                    onShortTap = {
-                                        // Forward tap to center HUD toggle for convenience
-                                        onToggleHud()
-                                    },
+                                    onTapWindowOffset = { winPos -> handleTapAtOffset(winPos) },
                                     onLongPress = {
                                         val txt = block.plainText().trim()
                                         if (txt.isNotEmpty()) {
@@ -355,7 +361,7 @@ fun ReflowableReaderView(
                             isDark = isDark,
                             highlight = hl,
                             isTtsActive = isTtsSpeaking,
-                            onShortTap = onToggleHud,
+                            onTapWindowOffset = { onToggleHud() },
                             onLongPress = {
                                 val txt = block.plainText().trim()
                                 if (txt.isNotEmpty()) {
@@ -407,7 +413,6 @@ fun ReflowableReaderView(
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun RenderContentBlock(
     block: ContentBlock,
@@ -418,9 +423,11 @@ private fun RenderContentBlock(
     isDark: Boolean,
     highlight: HighlightEntity?,
     isTtsActive: Boolean,
-    onShortTap: () -> Unit,
+    onTapWindowOffset: (Offset) -> Unit,
     onLongPress: () -> Unit
 ) {
+    var blockWindowPos by remember { mutableStateOf(Offset.Zero) }
+
     val bgHighlight = when {
         highlight != null -> Color(if (isDark) highlight.color.bgHexDark else highlight.color.bgHexLight)
         else -> Color.Transparent
@@ -439,10 +446,16 @@ private fun RenderContentBlock(
         Modifier
     }
 
-    val clickMod = Modifier.combinedClickable(
-        onClick = onShortTap,
-        onLongClick = onLongPress
-    )
+    val clickMod = Modifier
+        .onGloballyPositioned { coords ->
+            blockWindowPos = coords.positionInWindow()
+        }
+        .pointerInput(onTapWindowOffset, onLongPress) {
+            detectTapGestures(
+                onTap = { localPos -> onTapWindowOffset(blockWindowPos + localPos) },
+                onLongPress = { onLongPress() }
+            )
+        }
 
     val baseLineHeight = (settings.fontSizeSp * settings.lineHeightMultiplier).sp
     val letterSpacing = if (settings.fontFamily == ReaderFontFamily.DYSLEXIC_WIDE) 0.05.sp else 0.sp
