@@ -17,13 +17,17 @@ import com.imsharman.liber.data.local.entity.LinkedFolderEntity
 import com.imsharman.liber.data.local.entity.ReadingSessionEntity
 import com.imsharman.liber.data.local.entity.ReadingSessionWithBook
 import com.imsharman.liber.data.parser.BookParserDispatcher
+import com.imsharman.liber.data.preferences.ReaderPreferencesRepository
+import com.imsharman.liber.data.remote.OpenLibraryService
 import com.imsharman.liber.data.storage.InternalSandboxManager
 import com.imsharman.liber.data.storage.ScopedFolderScanner
 import com.imsharman.liber.domain.model.BookFormat
 import com.imsharman.liber.domain.model.HighlightColor
 import com.imsharman.liber.domain.model.ReadingStatus
+import com.imsharman.liber.domain.util.BookMetadataNormalizer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.security.MessageDigest
@@ -35,7 +39,9 @@ class LibraryRepository(
     private val db: LiberDatabase,
     val sandboxManager: InternalSandboxManager,
     val parserDispatcher: BookParserDispatcher,
-    private val folderScanner: ScopedFolderScanner
+    private val folderScanner: ScopedFolderScanner,
+    private val openLibraryService: OpenLibraryService,
+    private val preferencesRepository: ReaderPreferencesRepository
 ) {
     private val bookDao = db.bookDao()
     private val collectionDao = db.collectionDao()
@@ -206,6 +212,23 @@ class LibraryRepository(
         val fingerprint = computeBookFingerprint(uri, resolvedName, resolvedSize)
         val parsedMeta = parserDispatcher.parseMetadataForImport(uri, resolvedName, format)
 
+        val offlineOnly = runCatching { preferencesRepository.readerSettingsFlow.first().offlineOnlyMode }
+            .getOrDefault(false)
+
+        var resolvedSeriesName = parsedMeta.seriesName
+        var resolvedSeriesIndex = parsedMeta.seriesIndex
+        if (resolvedSeriesName == null && !offlineOnly) {
+            val remoteSeries = openLibraryService.resolveSeriesForBook(
+                title = parsedMeta.title,
+                author = parsedMeta.author,
+                offlineOnlyMode = false
+            )
+            if (remoteSeries != null) {
+                resolvedSeriesName = remoteSeries.seriesName
+                resolvedSeriesIndex = remoteSeries.seriesIndex
+            }
+        }
+
         val internalCoverPath = parsedMeta.embeddedCoverBytes?.let { bytes ->
             sandboxManager.saveCoverBytes(bytes, "book_${fingerprint.take(12)}")
         }
@@ -221,8 +244,8 @@ class LibraryRepository(
             format = format,
             title = parsedMeta.title,
             author = parsedMeta.author,
-            seriesName = parsedMeta.seriesName,
-            seriesIndex = parsedMeta.seriesIndex,
+            seriesName = resolvedSeriesName,
+            seriesIndex = resolvedSeriesIndex,
             description = parsedMeta.description,
             publisher = parsedMeta.publisher,
             isbn = parsedMeta.isbn,
@@ -239,6 +262,92 @@ class LibraryRepository(
         )
         val insertedId = bookDao.insertBook(entity)
         return if (insertedId > 0L) insertedId else bookDao.getBookByUri(uriStr)?.id
+    }
+
+    /**
+     * Repairs and enriches existing library entries:
+     * 1. Immediately normalizes messy author variants (e.g. `'Brown, Pierce'`, `'Pierce Brown;'` -> `'Pierce Brown'`)
+     *    and series names (`'Red Rising Trilogy'` / `'Red Rising Saga'` -> `'Red Rising'`).
+     * 2. Re-parses local file metadata and queries Open Library (when online) for any book missing series info.
+     */
+    suspend fun repairAndEnrichLibraryMetadata(): Int = withContext(Dispatchers.IO) {
+        val books = bookDao.getAllBooksSnapshot()
+        if (books.isEmpty()) return@withContext 0
+
+        val offlineOnly = runCatching { preferencesRepository.readerSettingsFlow.first().offlineOnlyMode }
+            .getOrDefault(false)
+        var updatedCount = 0
+
+        // Pass 1: Fast offline author & series normalization across all existing books
+        for (book in books) {
+            val normAuthor = BookMetadataNormalizer.normalizeAuthor(book.author)
+            val normTitle = BookMetadataNormalizer.cleanBookTitle(book.title)
+            val normSeries = BookMetadataNormalizer.normalizeSeriesName(book.seriesName)
+            if (normAuthor != book.author || normTitle != book.title || normSeries != book.seriesName) {
+                bookDao.updateBook(
+                    book.copy(
+                        title = normTitle,
+                        author = normAuthor,
+                        seriesName = normSeries
+                    )
+                )
+                updatedCount++
+            }
+        }
+
+        // Pass 2: Re-check local file & Open Library for books still missing seriesName
+        val refreshedBooks = bookDao.getAllBooksSnapshot()
+        for (book in refreshedBooks) {
+            if (!book.seriesName.isNullOrBlank()) continue
+
+            var foundSeries: String? = null
+            var foundIndex: Float? = book.seriesIndex
+
+            // Check local file signals first (OPF, subtitle, frontmatter, filename, blurb)
+            val reParsed = runCatching {
+                parserDispatcher.parseMetadataForImport(Uri.parse(book.uriString), book.fileName, book.format)
+            }.getOrNull()
+
+            if (reParsed?.seriesName != null) {
+                foundSeries = reParsed.seriesName
+                if (foundIndex == null) foundIndex = reParsed.seriesIndex
+            } else {
+                val fromSignals = BookMetadataNormalizer.inferSeriesFromBookSignals(
+                    title = book.title,
+                    fileName = book.fileName,
+                    description = book.description
+                )
+                if (fromSignals != null) {
+                    foundSeries = fromSignals.seriesName
+                    if (foundIndex == null) foundIndex = fromSignals.seriesIndex
+                }
+            }
+
+            if (foundSeries == null && !offlineOnly) {
+                val remote = openLibraryService.resolveSeriesForBook(
+                    title = book.title,
+                    author = book.author,
+                    offlineOnlyMode = false
+                )
+                if (remote != null) {
+                    foundSeries = remote.seriesName
+                    if (foundIndex == null) foundIndex = remote.seriesIndex
+                }
+            }
+
+            if (!foundSeries.isNullOrBlank()) {
+                bookDao.updateBook(
+                    book.copy(
+                        seriesName = foundSeries,
+                        seriesIndex = foundIndex,
+                        updatedAtEpochMs = System.currentTimeMillis()
+                    )
+                )
+                updatedCount++
+            }
+        }
+
+        updatedCount
     }
 
     suspend fun toggleFavorite(bookId: Long, currentFavorite: Boolean) {
@@ -282,8 +391,9 @@ class LibraryRepository(
         bookDao.updateBook(
             current.copy(
                 title = title.trim().ifEmpty { current.title },
-                author = author.trim().ifEmpty { "Unknown Author" },
-                seriesName = seriesName?.trim()?.takeIf { it.isNotEmpty() },
+                author = BookMetadataNormalizer.normalizeAuthor(author),
+                seriesName = BookMetadataNormalizer.normalizeSeriesName(seriesName)
+                    ?: seriesName?.trim()?.takeIf { it.isNotEmpty() },
                 seriesIndex = seriesIndex,
                 description = description.trim(),
                 publisher = publisher.trim(),

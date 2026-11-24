@@ -233,6 +233,20 @@ fun MetadataEditorDialog(
                                             if (cand.subjects.isNotEmpty()) {
                                                 tagsCsv = cand.subjects.joinToString(", ")
                                             }
+                                            if (!cand.seriesName.isNullOrBlank()) {
+                                                seriesName = cand.seriesName
+                                            }
+                                            val resolvedSeries = openLibraryService.resolveSeriesForBook(
+                                                title = cand.title,
+                                                author = cand.author,
+                                                offlineOnlyMode = offlineOnlyMode
+                                            )
+                                            if (resolvedSeries != null) {
+                                                seriesName = resolvedSeries.seriesName
+                                                resolvedSeries.seriesIndex?.let { idx ->
+                                                    seriesIndexText = NotesMarkdownExporter.formatSeriesNumber(idx)
+                                                }
+                                            }
                                             val desc = openLibraryService.fetchWorkDescription(
                                                 cand.workKey,
                                                 offlineOnlyMode

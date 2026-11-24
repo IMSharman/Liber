@@ -1,5 +1,6 @@
 package com.imsharman.liber.data.parser
 
+import com.imsharman.liber.domain.util.BookMetadataNormalizer
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.Node
@@ -61,7 +62,9 @@ object EpubParser {
         val containerXml = entries["META-INF/container.xml"]?.toString(Charsets.UTF_8)
         val opfPath = containerXml?.let { xml ->
             val doc = Jsoup.parse(xml, "", Parser.xmlParser())
-            doc.selectFirst("rootfile")?.attr("full-path")?.takeIf { it.isNotBlank() }
+            doc.allElements
+                .firstOrNull { localTag(it) == "rootfile" }
+                ?.attr("full-path")?.takeIf { it.isNotBlank() }
         }?.let(::normalizeZipPath)
             ?: entries.keys.firstOrNull { it.endsWith(".opf", ignoreCase = true) }
 
@@ -73,62 +76,125 @@ object EpubParser {
         val opfDir = opfPath.substringBeforeLast('/', missingDelimiterValue = "")
         val opfDoc = Jsoup.parse(entries.getValue(opfPath).toString(Charsets.UTF_8), "", Parser.xmlParser())
 
-        // 2. Extract Dublin Core & EPUB2/EPUB3/Calibre metadata
-        val title = opfDoc.select("metadata > title, metadata > dc|title, dc|title, title")
-            .firstOrNull()?.text()?.trim()?.takeIf { it.isNotBlank() } ?: fallbackTitle
+        val metadataRoot = opfDoc.allElements.firstOrNull { localTag(it) == "metadata" } ?: opfDoc
+        val metaElements = metadataRoot.allElements.filter { localTag(it) == "meta" }
 
-        val authors = opfDoc.select("metadata > creator, metadata > dc|creator, dc|creator, creator")
+        // Map title-type refinements (main vs subtitle vs collection)
+        val titleTypeById = HashMap<String, String>()
+        for (m in metaElements) {
+            val prop = m.attr("property").substringAfter(':').lowercase()
+            val refines = m.attr("refines").removePrefix("#").trim()
+            if (prop == "title-type" && refines.isNotEmpty()) {
+                titleTypeById[refines] = m.text().trim().lowercase()
+            }
+        }
+
+        val titleElements = metadataRoot.allElements.filter {
+            it !== metadataRoot && localTag(it) == "title"
+        }
+        val mainTitleEl = titleElements.firstOrNull { el ->
+            val id = el.attr("id")
+            id.isNotEmpty() && titleTypeById[id] == "main"
+        } ?: titleElements.firstOrNull { el ->
+            val id = el.attr("id")
+            titleTypeById[id] !in setOf("subtitle", "collection")
+        } ?: titleElements.firstOrNull()
+
+        val rawTitle = mainTitleEl?.text()?.trim()?.takeIf { it.isNotBlank() } ?: fallbackTitle
+        val subtitleText = titleElements.firstOrNull { el ->
+            el !== mainTitleEl && titleTypeById[el.attr("id")] == "subtitle"
+        }?.text()?.trim() ?: titleElements.drop(1).firstOrNull()?.text()?.trim()
+        val collectionTitleText = titleElements.firstOrNull { el ->
+            titleTypeById[el.attr("id")] == "collection"
+        }?.text()?.trim()
+
+        val rawCreators = metadataRoot.allElements
+            .filter { localTag(it) == "creator" }
             .mapNotNull { it.text().trim().takeIf(String::isNotEmpty) }
-        val author = if (authors.isEmpty()) "Unknown Author" else authors.joinToString(", ")
+        val author = BookMetadataNormalizer.normalizeAuthor(rawCreators.joinToString("; "))
 
-        val rawDescription = opfDoc.select("metadata > description, metadata > dc|description, dc|description, description")
-            .firstOrNull()?.text()?.trim().orEmpty()
+        val rawDescription = metadataRoot.allElements
+            .firstOrNull { localTag(it) == "description" }
+            ?.text()?.trim().orEmpty()
         val description = if (rawDescription.contains('<')) {
             Jsoup.parse(rawDescription).text().trim()
         } else {
             rawDescription
         }
 
-        val publisher = opfDoc.select("metadata > publisher, metadata > dc|publisher, dc|publisher")
-            .firstOrNull()?.text()?.trim().orEmpty()
+        val publisher = metadataRoot.allElements
+            .firstOrNull { localTag(it) == "publisher" }
+            ?.text()?.trim().orEmpty()
 
-        val language = opfDoc.select("metadata > language, metadata > dc|language, dc|language")
-            .firstOrNull()?.text()?.trim().orEmpty()
+        val language = metadataRoot.allElements
+            .firstOrNull { localTag(it) == "language" }
+            ?.text()?.trim().orEmpty()
 
-        val isbn = opfDoc.select("metadata > identifier, metadata > dc|identifier, dc|identifier")
+        val isbn = metadataRoot.allElements
+            .filter { localTag(it) == "identifier" }
             .map { it.text().trim() }
             .firstOrNull { id ->
                 val digits = id.filter { it.isDigit() || it.equals('X', ignoreCase = true) }
                 id.contains("isbn", ignoreCase = true) || digits.length == 10 || digits.length == 13
             }?.replace(Regex("(?i)^urn:isbn:"), "")?.trim().orEmpty()
 
-        val tags = opfDoc.select("metadata > subject, metadata > dc|subject, dc|subject")
+        val tags = metadataRoot.allElements
+            .filter { localTag(it) == "subject" }
             .mapNotNull { it.text().trim().takeIf(String::isNotEmpty) }
             .distinct()
 
-        // Series metadata (Calibre EPUB2 or EPUB3 belongs-to-collection)
-        var seriesName: String? = opfDoc.selectFirst("meta[name=calibre:series]")?.attr("content")?.trim()
-            ?.takeIf { it.isNotEmpty() }
-        var seriesIndex: Float? = opfDoc.selectFirst("meta[name=calibre:series_index]")?.attr("content")
-            ?.toFloatOrNull()
+        // 2b. Series metadata: Calibre EPUB2, EPUB3 belongs-to-collection, generic series meta, & title/blurb signals
+        var seriesName: String? = null
+        var seriesIndex: Float? = null
+
+        for (m in metaElements) {
+            val nameAttr = m.attr("name").lowercase()
+            val contentAttr = m.attr("content").trim()
+            when (nameAttr) {
+                "calibre:series", "series", "book-series", "opf:series" -> {
+                    if (contentAttr.isNotEmpty() && seriesName == null) seriesName = contentAttr
+                }
+                "calibre:series_index", "series_index", "series-index", "sequence" -> {
+                    if (contentAttr.isNotEmpty() && seriesIndex == null) {
+                        seriesIndex = BookMetadataNormalizer.parseNumberToken(contentAttr)
+                    }
+                }
+            }
+        }
 
         if (seriesName == null) {
-            val collectionMeta = opfDoc.selectFirst("meta[property=belongs-to-collection]")
+            val collectionMeta = metaElements.firstOrNull { m ->
+                val prop = m.attr("property").substringAfter(':').lowercase()
+                prop == "belongs-to-collection" || prop == "ispartof"
+            }
             if (collectionMeta != null) {
-                seriesName = collectionMeta.text().trim().takeIf { it.isNotEmpty() }
-                val collectionId = collectionMeta.attr("id")
+                seriesName = collectionMeta.text().trim().ifEmpty { collectionMeta.attr("content").trim() }
+                    .takeIf { it.isNotEmpty() }
+                val collectionId = collectionMeta.attr("id").trim()
                 if (collectionId.isNotEmpty()) {
-                    seriesIndex = opfDoc.selectFirst("meta[refines=#$collectionId][property=group-position]")
-                        ?.text()?.trim()?.toFloatOrNull()
+                    val groupPosMeta = metaElements.firstOrNull { m ->
+                        m.attr("refines").removePrefix("#").trim() == collectionId &&
+                            m.attr("property").substringAfter(':').equals("group-position", ignoreCase = true)
+                    }
+                    seriesIndex = groupPosMeta?.text()?.trim()?.let(BookMetadataNormalizer::parseNumberToken)
                 }
+            }
+        }
+
+        if (seriesName == null && !collectionTitleText.isNullOrBlank()) {
+            val parsedCol = BookMetadataNormalizer.parseSeriesAndNumberFromEditionString(collectionTitleText)
+            if (parsedCol != null) {
+                seriesName = parsedCol.seriesName
+                if (seriesIndex == null) seriesIndex = parsedCol.seriesIndex
             }
         }
 
         // 3. Manifest map: id -> (resolvedZipPath, mediaType, properties)
         data class ManifestItem(val id: String, val zipPath: String, val mediaType: String, val properties: String)
 
+        val manifestRoot = opfDoc.allElements.firstOrNull { localTag(it) == "manifest" } ?: opfDoc
         val manifestById = LinkedHashMap<String, ManifestItem>()
-        for (item in opfDoc.select("manifest > item")) {
+        for (item in manifestRoot.allElements.filter { localTag(it) == "item" }) {
             val id = item.attr("id")
             val href = decodeHref(item.attr("href"))
             if (id.isNotEmpty() && href.isNotEmpty()) {
@@ -143,7 +209,9 @@ object EpubParser {
         }
 
         // 4. Locate embedded cover bytes strictly inside the EPUB archive
-        val coverMetaId = opfDoc.selectFirst("meta[name=cover]")?.attr("content")?.trim()
+        val coverMetaId = metaElements
+            .firstOrNull { it.attr("name").equals("cover", ignoreCase = true) }
+            ?.attr("content")?.trim()
         val coverItem = when {
             !coverMetaId.isNullOrEmpty() && manifestById.containsKey(coverMetaId) ->
                 manifestById[coverMetaId]
@@ -157,7 +225,9 @@ object EpubParser {
         val coverBytes = coverItem?.let { entries[it.zipPath] }
 
         // 5. Spine ordered itemrefs
-        val spineItemIds = opfDoc.select("spine > itemref")
+        val spineRoot = opfDoc.allElements.firstOrNull { localTag(it) == "spine" } ?: opfDoc
+        val spineItemIds = spineRoot.allElements
+            .filter { localTag(it) == "itemref" }
             .filterNot { it.attr("linear").equals("no", ignoreCase = true) }
             .map { it.attr("idref") }
             .filter { manifestById.containsKey(it) }
@@ -169,6 +239,29 @@ object EpubParser {
                 it.mediaType.contains("html", ignoreCase = true) || it.zipPath.endsWith(".xhtml", true) || it.zipPath.endsWith(".html", true)
             }
         }
+
+        // If OPF lacked explicit series meta, check title/subtitle/description and frontmatter title-page text
+        if (seriesName == null) {
+            val frontMatterSample = spineItems.take(3).joinToString("\n") { spItem ->
+                val bytes = entries[spItem.zipPath]
+                if (bytes != null && bytes.size <= 32_768) {
+                    Jsoup.parse(bytes.toString(Charsets.UTF_8)).text().take(600)
+                } else ""
+            }
+            val inferred = BookMetadataNormalizer.inferSeriesFromBookSignals(
+                title = rawTitle,
+                subtitle = subtitleText,
+                fileName = fallbackTitle,
+                description = "$description\n$frontMatterSample"
+            )
+            if (inferred != null) {
+                seriesName = inferred.seriesName
+                if (seriesIndex == null) seriesIndex = inferred.seriesIndex
+            }
+        }
+
+        seriesName = BookMetadataNormalizer.normalizeSeriesName(seriesName)
+        val title = BookMetadataNormalizer.cleanBookTitle(rawTitle)
 
         if (!parseFullChapters) {
             val meta = ParsedBookMetadata(
@@ -292,12 +385,17 @@ object EpubParser {
             val navPath = navItem.second
             val navDir = navPath.substringBeforeLast('/', missingDelimiterValue = "")
             val navDoc = Jsoup.parse(entries.getValue(navPath).toString(Charsets.UTF_8))
-            val tocNav = navDoc.selectFirst("nav[epub:type=toc], nav[*|type=toc], nav#toc, nav")
+            val tocNav = navDoc.select("nav").firstOrNull { nav ->
+                nav.attributes().any { attr ->
+                    attr.key.substringAfter(':').equals("type", ignoreCase = true) &&
+                        attr.value.equals("toc", ignoreCase = true)
+                } || nav.id().equals("toc", ignoreCase = true)
+            } ?: navDoc.selectFirst("nav")
             if (tocNav != null) {
                 val result = mutableListOf<Triple<String, String, Int>>()
                 fun walkOl(ol: Element, depth: Int) {
-                    for (li in ol.children().filter { it.tagName().equals("li", true) }) {
-                        val a = li.children().firstOrNull { it.tagName().equals("a", true) }
+                    for (li in ol.children().filter { localTag(it) == "li" }) {
+                        val a = li.children().firstOrNull { localTag(it) == "a" }
                         if (a != null) {
                             val href = decodeHref(a.attr("href"))
                             val text = a.text().trim()
@@ -306,16 +404,16 @@ object EpubParser {
                                 result += Triple(base, text, depth)
                             }
                         }
-                        li.children().filter { it.tagName().equals("ol", true) }.forEach { walkOl(it, depth + 1) }
+                        li.children().filter { localTag(it) == "ol" }.forEach { walkOl(it, depth + 1) }
                     }
                 }
-                tocNav.children().filter { it.tagName().equals("ol", true) }.forEach { walkOl(it, 0) }
+                tocNav.children().filter { localTag(it) == "ol" }.forEach { walkOl(it, 0) }
                 if (result.isNotEmpty()) return result
             }
         }
 
         // Fallback to EPUB 2 NCX
-        val spineTocId = opfDoc.selectFirst("spine")?.attr("toc")?.trim()
+        val spineTocId = opfDoc.allElements.firstOrNull { localTag(it) == "spine" }?.attr("toc")?.trim()
         val ncxItem = manifestSummary.firstOrNull { (id, path, meta) ->
             (!spineTocId.isNullOrEmpty() && id == spineTocId) ||
                 meta.second.contains("dtbncx", ignoreCase = true) ||
@@ -325,13 +423,15 @@ object EpubParser {
             val ncxPath = ncxItem.second
             val ncxDir = ncxPath.substringBeforeLast('/', missingDelimiterValue = "")
             val ncxDoc = Jsoup.parse(entries.getValue(ncxPath).toString(Charsets.UTF_8), "", Parser.xmlParser())
-            val navMap = ncxDoc.selectFirst("navMap")
+            val navMap = ncxDoc.allElements.firstOrNull { localTag(it) == "navmap" }
             if (navMap != null) {
                 val result = mutableListOf<Triple<String, String, Int>>()
                 fun walkNavPoint(parent: Element, depth: Int) {
-                    for (np in parent.children().filter { it.tagName().equals("navPoint", true) }) {
-                        val label = np.selectFirst("navLabel > text")?.text()?.trim().orEmpty()
-                        val src = decodeHref(np.selectFirst("content")?.attr("src").orEmpty())
+                    for (np in parent.children().filter { localTag(it) == "navpoint" }) {
+                        val label = np.allElements.firstOrNull { localTag(it) == "text" }?.text()?.trim().orEmpty()
+                        val src = decodeHref(
+                            np.children().firstOrNull { localTag(it) == "content" }?.attr("src").orEmpty()
+                        )
                         if (label.isNotEmpty() && src.isNotEmpty()) {
                             val base = resolveRelativePath(ncxDir, src.substringBefore('#'))
                             result += Triple(base, label, depth)
@@ -346,6 +446,8 @@ object EpubParser {
 
         return emptyList()
     }
+
+    private fun localTag(el: Element): String = el.tagName().substringAfter(':').lowercase()
 
     private fun decodeHref(raw: String): String =
         runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw).trim()

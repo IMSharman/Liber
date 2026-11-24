@@ -13,6 +13,7 @@ import com.imsharman.liber.domain.model.LibrarySection
 import com.imsharman.liber.domain.model.LibrarySortOrder
 import com.imsharman.liber.domain.model.LibraryViewMode
 import com.imsharman.liber.domain.model.ReadingStatus
+import com.imsharman.liber.domain.util.BookMetadataNormalizer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -71,6 +72,12 @@ class LibraryViewModel(
     private val isImportingState = MutableStateFlow(false)
     private val bannerState = MutableStateFlow<String?>(null)
 
+    init {
+        viewModelScope.launch {
+            repo.repairAndEnrichLibraryMetadata()
+        }
+    }
+
     val uiState: StateFlow<LibraryUiState> = combine(
         repo.observeAllBooksWithCollections(),
         repo.observeCollections(),
@@ -94,16 +101,21 @@ class LibraryViewModel(
         val banner = values[7] as String?
 
         val authorGroups = allBooks
-            .groupBy { it.book.author.ifBlank { "Unknown Author" } }
-            .map { (a, list) -> AuthorGroup(a, list.sortedBy { it.book.title.lowercase() }) }
+            .groupBy { BookMetadataNormalizer.canonicalAuthorKey(it.book.author) }
+            .map { (_, list) ->
+                val displayAuthor = BookMetadataNormalizer.normalizeAuthor(list.first().book.author)
+                AuthorGroup(displayAuthor, list.sortedBy { it.book.title.lowercase() })
+            }
             .sortedBy { it.author.lowercase() }
 
         val seriesGroups = allBooks
             .filter { !it.book.seriesName.isNullOrBlank() }
-            .groupBy { it.book.seriesName!!.trim() }
-            .map { (s, list) ->
+            .groupBy { BookMetadataNormalizer.canonicalSeriesKey(it.book.seriesName) ?: it.book.seriesName!!.trim().lowercase() }
+            .map { (_, list) ->
+                val displaySeries = BookMetadataNormalizer.normalizeSeriesName(list.first().book.seriesName)
+                    ?: list.first().book.seriesName!!.trim()
                 SeriesGroup(
-                    s,
+                    displaySeries,
                     list.sortedWith(
                         compareBy<BookWithCollections> { it.book.seriesIndex ?: Float.MAX_VALUE }
                             .thenBy { it.book.title.lowercase() }
@@ -120,12 +132,17 @@ class LibraryViewModel(
             LibrarySection.HAVE_READ -> allBooks.filter { it.book.readingStatus == ReadingStatus.HAVE_READ }
             LibrarySection.AUTHORS -> {
                 if (criteria.author != null) {
-                    allBooks.filter { it.book.author.equals(criteria.author, ignoreCase = true) }
+                    val targetKey = BookMetadataNormalizer.canonicalAuthorKey(criteria.author)
+                    allBooks.filter { BookMetadataNormalizer.canonicalAuthorKey(it.book.author) == targetKey }
                 } else allBooks
             }
             LibrarySection.SERIES -> {
                 if (criteria.series != null) {
-                    allBooks.filter { it.book.seriesName?.equals(criteria.series, ignoreCase = true) == true }
+                    val targetKey = BookMetadataNormalizer.canonicalSeriesKey(criteria.series)
+                    allBooks.filter {
+                        val bookKey = BookMetadataNormalizer.canonicalSeriesKey(it.book.seriesName)
+                        bookKey != null && bookKey == targetKey
+                    }
                 } else allBooks.filter { !it.book.seriesName.isNullOrBlank() }
             }
             LibrarySection.COLLECTIONS -> {
@@ -322,6 +339,19 @@ class LibraryViewModel(
             repo.importBundledSampleClassic()
             isImportingState.value = false
             bannerState.value = "Loaded public-domain classic: Meditations by Marcus Aurelius."
+        }
+    }
+
+    fun refreshMetadataAndSeries() {
+        viewModelScope.launch {
+            isImportingState.value = true
+            val updated = repo.repairAndEnrichLibraryMetadata()
+            isImportingState.value = false
+            bannerState.value = if (updated > 0) {
+                "Updated author/series metadata on $updated book${if (updated == 1) "" else "s"}."
+            } else {
+                "All author & series metadata is up to date."
+            }
         }
     }
 

@@ -1,5 +1,7 @@
 package com.imsharman.liber.data.remote
 
+import com.imsharman.liber.domain.util.BookMetadataNormalizer
+import com.imsharman.liber.domain.util.InferredSeries
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -23,16 +25,16 @@ data class BookLookupCandidate(
     val publisher: String,
     val isbn: String,
     val subjects: List<String>,
-    val coverId: Int?
+    val coverId: Int?,
+    val seriesName: String? = null
 ) {
     val coverUrl: String?
         get() = coverId?.let { "https://covers.openlibrary.org/b/id/$it-L.jpg" }
 }
 
 /**
- * Opt-in metadata & cover lookup using the open, account-free Open Library API.
- * Strictly triggered ONLY when the user clicks "Search Online" in the Metadata Editor,
- * and completely blocked when `offlineOnlyMode` is enabled.
+ * Metadata, series, and cover lookup using the open, account-free Open Library API.
+ * Completely disabled whenever `offlineOnlyMode` is enabled in Settings.
  */
 class OpenLibraryService {
 
@@ -67,7 +69,7 @@ class OpenLibraryService {
 
             val req = Request.Builder()
                 .url(url)
-                .header("User-Agent", "LiberReader/1.0 (Android; Privacy-First Ebook Reader)")
+                .header("User-Agent", "LiberReader/1.1 (Android)")
                 .build()
 
             client.newCall(req).execute().use { resp ->
@@ -82,12 +84,12 @@ class OpenLibraryService {
                     val obj = el.jsonObject
                     val title = obj["title"]?.jsonPrimitive?.contentOrNull?.trim() ?: return@mapNotNull null
                     val workKey = obj["key"]?.jsonPrimitive?.contentOrNull.orEmpty()
-                    val authors = obj["author_name"]?.jsonArray
+                    val rawAuthors = obj["author_name"]?.jsonArray
                         ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trim() }
                         ?.take(3)
-                        ?.joinToString(", ")
+                        ?.joinToString("; ")
                         .orEmpty()
-                        .ifEmpty { "Unknown Author" }
+                    val author = BookMetadataNormalizer.normalizeAuthor(rawAuthors)
                     val year = obj["first_publish_year"]?.jsonPrimitive?.intOrNull
                     val publisher = obj["publisher"]?.jsonArray
                         ?.firstOrNull()?.jsonPrimitive?.contentOrNull.orEmpty()
@@ -95,25 +97,158 @@ class OpenLibraryService {
                         ?.mapNotNull { it.jsonPrimitive.contentOrNull }
                         ?.firstOrNull { it.length == 13 || it.length == 10 }
                         .orEmpty()
-                    val subjects = obj["subject"]?.jsonArray
+                    val allSubjects = obj["subject"]?.jsonArray
                         ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trim() }
-                        ?.take(5)
                         .orEmpty()
+                    val detectedSeries = extractSeriesNameFromSubjects(allSubjects)
+                    val cleanSubjects = allSubjects
+                        .filterNot { it.contains(':') }
+                        .take(5)
                     val coverId = obj["cover_i"]?.jsonPrimitive?.intOrNull
 
                     BookLookupCandidate(
                         workKey = workKey,
                         title = title,
-                        author = authors,
+                        author = author,
                         firstPublishYear = year,
                         publisher = publisher,
                         isbn = isbn,
-                        subjects = subjects,
-                        coverId = coverId
+                        subjects = cleanSubjects,
+                        coverId = coverId,
+                        seriesName = detectedSeries
                     )
                 }
             }
         }
+    }
+
+    /**
+     * Resolves canonical series name and book `#` for retail ebooks that omit OPF series metadata
+     * (e.g., *Red Rising*, *Golden Son*, *Morning Star*, *Iron Gold* -> `Red Rising #1..#4`).
+     */
+    suspend fun resolveSeriesForBook(
+        title: String,
+        author: String,
+        offlineOnlyMode: Boolean
+    ): InferredSeries? = withContext(Dispatchers.IO) {
+        if (offlineOnlyMode) return@withContext null
+        val cleanTitle = BookMetadataNormalizer.cleanBookTitle(title).trim()
+        if (cleanTitle.isEmpty()) return@withContext null
+
+        val primaryAuthor = BookMetadataNormalizer.normalizeAuthor(author)
+            .substringBefore(',')
+            .takeIf { !it.equals("Unknown Author", ignoreCase = true) }
+
+        runCatching {
+            val urlBuilder = "https://openlibrary.org/search.json".toHttpUrl().newBuilder()
+                .addQueryParameter("title", cleanTitle)
+                .addQueryParameter("limit", "4")
+                .addQueryParameter("fields", "key,title,author_name,subject")
+            if (!primaryAuthor.isNullOrBlank()) {
+                urlBuilder.addQueryParameter("author", primaryAuthor)
+            }
+
+            val req = Request.Builder()
+                .url(urlBuilder.build())
+                .header("User-Agent", "LiberReader/1.1 (Android)")
+                .build()
+
+            var workKey: String? = null
+            var subjectSeries: String? = null
+
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use
+                val docs = json.parseToJsonElement(resp.body?.string().orEmpty())
+                    .jsonObject["docs"]?.jsonArray ?: return@use
+
+                for (docEl in docs) {
+                    val obj = docEl.jsonObject
+                    val key = obj["key"]?.jsonPrimitive?.contentOrNull ?: continue
+                    val subjects = obj["subject"]?.jsonArray
+                        ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trim() }
+                        .orEmpty()
+                    val candidateSeries = extractSeriesNameFromSubjects(subjects)
+                    if (workKey == null) workKey = key
+                    if (candidateSeries != null) {
+                        workKey = key
+                        subjectSeries = candidateSeries
+                        break
+                    }
+                }
+            }
+
+            val resolvedWorkKey = workKey ?: return@runCatching null
+            val editionSeriesItems = fetchEditionSeriesStrings(resolvedWorkKey)
+            val parsedEditions = editionSeriesItems.mapNotNull {
+                BookMetadataNormalizer.parseSeriesAndNumberFromEditionString(it)
+            }.filterNot {
+                val lower = it.seriesName.lowercase()
+                lower.contains("large print") || lower.contains("penguin") || lower.contains("vintage")
+            }
+
+            val finalSeriesName = subjectSeries
+                ?: parsedEditions.map { it.seriesName }
+                    .groupingBy { BookMetadataNormalizer.canonicalSeriesKey(it) ?: it.lowercase() }
+                    .eachCount()
+                    .maxByOrNull { it.value }
+                    ?.let { bestKey ->
+                        parsedEditions.firstOrNull {
+                            (BookMetadataNormalizer.canonicalSeriesKey(it.seriesName) ?: it.seriesName.lowercase()) == bestKey.key
+                        }?.seriesName
+                    }
+                ?: return@runCatching null
+
+            val targetKey = BookMetadataNormalizer.canonicalSeriesKey(finalSeriesName)
+
+            // Prefer volume numbers from editions matching the canonical series name, else mode across all editions
+            val matchingNumbers = parsedEditions
+                .filter { BookMetadataNormalizer.canonicalSeriesKey(it.seriesName) == targetKey }
+                .mapNotNull { it.seriesIndex }
+
+            val allNumbers = parsedEditions.mapNotNull { it.seriesIndex }
+            val chosenNumber: Float? = mostFrequentFloat(matchingNumbers)
+                ?: mostFrequentFloat(allNumbers)
+                ?: if (BookMetadataNormalizer.canonicalSeriesKey(cleanTitle) == targetKey) 1f else null
+
+            InferredSeries(seriesName = finalSeriesName, seriesIndex = chosenNumber)
+        }.getOrNull()
+    }
+
+    private fun extractSeriesNameFromSubjects(subjects: List<String>): String? {
+        val franchise = subjects.firstOrNull { it.startsWith("franchise:", ignoreCase = true) }
+            ?.substringAfter(':')?.trim()
+            ?.let(BookMetadataNormalizer::normalizeSeriesName)
+        if (franchise != null) return franchise
+
+        return subjects
+            .filter { it.startsWith("series:", ignoreCase = true) }
+            .mapNotNull { BookMetadataNormalizer.normalizeSeriesName(it.substringAfter(':')) }
+            .firstOrNull()
+    }
+
+    private fun fetchEditionSeriesStrings(workKey: String): List<String> {
+        if (!workKey.startsWith("/works/")) return emptyList()
+        return runCatching {
+            val req = Request.Builder()
+                .url("https://openlibrary.org$workKey/editions.json?limit=30")
+                .header("User-Agent", "LiberReader/1.1 (Android)")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use emptyList()
+                val entries = json.parseToJsonElement(resp.body?.string().orEmpty())
+                    .jsonObject["entries"]?.jsonArray ?: return@use emptyList()
+                entries.flatMap { entry ->
+                    entry.jsonObject["series"]?.jsonArray
+                        ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trim() }
+                        .orEmpty()
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun mostFrequentFloat(values: List<Float>): Float? {
+        if (values.isEmpty()) return null
+        return values.groupingBy { it }.eachCount().maxByOrNull { it.value }?.key
     }
 
     suspend fun fetchWorkDescription(workKey: String, offlineOnlyMode: Boolean): String =
@@ -122,7 +257,7 @@ class OpenLibraryService {
             runCatching {
                 val req = Request.Builder()
                     .url("https://openlibrary.org$workKey.json")
-                    .header("User-Agent", "LiberReader/1.0")
+                    .header("User-Agent", "LiberReader/1.1 (Android)")
                     .build()
                 client.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) return@use ""
@@ -143,7 +278,7 @@ class OpenLibraryService {
             runCatching {
                 val req = Request.Builder()
                     .url(coverUrl)
-                    .header("User-Agent", "LiberReader/1.0")
+                    .header("User-Agent", "LiberReader/1.1 (Android)")
                     .build()
                 client.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) null else resp.body?.bytes()

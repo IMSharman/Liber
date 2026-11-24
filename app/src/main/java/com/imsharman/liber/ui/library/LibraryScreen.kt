@@ -156,7 +156,7 @@ fun LibraryScreen(
                         color = MaterialTheme.colorScheme.primary
                     )
                     Text(
-                        text = "Private Offline Book & Document Reader",
+                        text = "Ebook, Comic & Document Reader",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -443,7 +443,9 @@ fun LibraryScreen(
                     state.activeSection == LibrarySection.SERIES && state.selectedSeries == null && state.searchQuery.isBlank() -> {
                         SeriesDirectoryList(
                             groups = state.seriesGroups,
-                            onSelectSeries = viewModel::jumpToSeries
+                            hasAnyBooks = state.allBooks.isNotEmpty(),
+                            onSelectSeries = viewModel::jumpToSeries,
+                            onDetectSeries = viewModel::refreshMetadataAndSeries
                         )
                     }
 
@@ -729,15 +731,33 @@ private fun AuthorsDirectoryList(
 @Composable
 private fun SeriesDirectoryList(
     groups: List<SeriesGroup>,
-    onSelectSeries: (String) -> Unit
+    hasAnyBooks: Boolean,
+    onSelectSeries: (String) -> Unit,
+    onDetectSeries: () -> Unit
 ) {
     if (groups.isEmpty()) {
         Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-            Text(
-                "No books with Series metadata yet. EPUB/FB2/CBZ series tags are detected automatically, or you can assign Series & Book # in Edit Metadata.",
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    "No series detected yet.",
+                    style = MaterialTheme.typography.titleLarge
+                )
+                Text(
+                    "Series tags from EPUB/FB2/CBZ files and Open Library are grouped automatically, or you can set Series & Book # in Edit Metadata.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (hasAnyBooks) {
+                    FilledTonalButton(onClick = onDetectSeries) {
+                        Icon(Icons.Default.Refresh, contentDescription = null)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Auto-Detect Series")
+                    }
+                }
+            }
         }
         return
     }
@@ -746,6 +766,18 @@ private fun SeriesDirectoryList(
         verticalArrangement = Arrangement.spacedBy(10.dp),
         modifier = Modifier.fillMaxSize()
     ) {
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End
+            ) {
+                TextButton(onClick = onDetectSeries) {
+                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Refresh Series Info")
+                }
+            }
+        }
         items(groups, key = { it.seriesName }) { group ->
             Card(
                 shape = RoundedCornerShape(12.dp),
