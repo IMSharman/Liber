@@ -160,10 +160,10 @@ class ReaderViewModel(
         chapterIndex: Int,
         blockIndex: Int,
         subPageFraction: Float = 0f,
-        recordJumpOrigin: Boolean = false
+        recordJumpOrigin: Boolean = false,
+        exactBookFraction: Float? = null
     ) {
         val current = _uiState.value
-        val loaded = current.content ?: return
         val chapters = current.activeReflowChapters
         if (chapters.isEmpty()) return
 
@@ -196,7 +196,8 @@ class ReaderViewModel(
         } else {
             ((safeBlock + subPageFraction) / chap.blocks.size.toFloat()).coerceIn(0f, 1f)
         }
-        val overallProgress = ((safeChap + chapProgress) / chapters.size.toFloat()).coerceIn(0f, 1f)
+        val overallProgress = (exactBookFraction ?: ((safeChap + chapProgress) / chapters.size.toFloat()))
+            .coerceIn(0f, 1f)
 
         _uiState.value = current.copy(
             currentChapterIndex = safeChap,

@@ -14,14 +14,17 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -47,12 +50,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -198,6 +203,9 @@ fun ReaderScreen(
         }
     }
 
+    var measuredBookPage by remember { mutableIntStateOf(0) }
+    var measuredTotalPages by remember { mutableIntStateOf(0) }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -211,7 +219,11 @@ fun ReaderScreen(
             val useVisualPager = content is LoadedBookContent.VisualPaged &&
                 !(book.format == BookFormat.PDF && settings.pdfReflowMode && content.reflowChapters.isNotEmpty())
 
-            Column(modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .windowInsetsPadding(WindowInsets.safeDrawing)
+            ) {
                 Box(modifier = Modifier.weight(1f)) {
                     if (useVisualPager) {
                         VisualPageReaderView(
@@ -235,8 +247,18 @@ fun ReaderScreen(
                             ttsChapterIndex = if (ttsState.isSpeaking) ttsState.chapterIndex else null,
                             ttsBlockIndex = if (ttsState.isSpeaking) ttsState.blockIndex else null,
                             volumeTurnEventTick = volumeTurnTick,
-                            onPositionChanged = { chap, blk, sub ->
-                                viewModel.onReflowPositionChanged(chap, blk, sub)
+                            onPositionChanged = { chap, blk, frac ->
+                                val isPaged = settings.scrollMode == com.imsharman.liber.domain.model.ReaderScrollMode.PAGINATED_HORIZONTAL
+                                viewModel.onReflowPositionChanged(
+                                    chapterIndex = chap,
+                                    blockIndex = blk,
+                                    subPageFraction = if (isPaged) 0f else frac,
+                                    exactBookFraction = if (isPaged && frac > 0f) frac else null
+                                )
+                            },
+                            onMeasuredPageStatsChanged = { curP, totP ->
+                                measuredBookPage = curP
+                                measuredTotalPages = totP
                             },
                             onToggleHud = { hudVisible = !hudVisible },
                             onBlockLongPressed = { chapIdx, chapTitle, blkIdx, txt, existingHl ->
@@ -294,14 +316,17 @@ fun ReaderScreen(
                     }
                 }
 
-                // Minimalist ReadEra-style Status Footer when HUD is hidden
-                if (settings.showMiniStatusFooter && !hudVisible) {
+                // Minimalist ReadEra-style Status Footer (keeps steady height so toggling HUD doesn't shift page layout)
+                if (settings.showMiniStatusFooter) {
                     val chapterLabel = state.activeReflowChapters.getOrNull(state.currentChapterIndex)?.title
                         ?: "Page ${state.currentPageIndex + 1} / ${state.totalUnits}"
+                    val pageStatPart = if (!useVisualPager && measuredTotalPages > 0) {
+                        "$measuredBookPage / $measuredTotalPages  •  "
+                    } else ""
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .navigationBarsPadding()
+                            .alpha(if (hudVisible) 0f else 1f)
                             .padding(horizontal = settings.horizontalMarginDp.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
@@ -316,7 +341,7 @@ fun ReaderScreen(
                         )
                         Spacer(modifier = Modifier.width(12.dp))
                         Text(
-                            text = "${(state.progressFraction * 100).toInt()}%  •  $timeString  •  $batteryPct%",
+                            text = "$pageStatPart${(state.progressFraction * 100).toInt()}%  •  $timeString  •  $batteryPct%",
                             color = fgColor.copy(alpha = 0.55f),
                             fontSize = 11.sp
                         )
@@ -476,10 +501,13 @@ fun ReaderScreen(
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Text(
-                                text = if (content is LoadedBookContent.VisualPaged && !settings.pdfReflowMode) {
-                                    "Page ${state.currentPageIndex + 1} of ${content.pageCount}"
-                                } else {
-                                    "Chapter ${state.currentChapterIndex + 1} of ${state.activeReflowChapters.size.coerceAtLeast(1)}"
+                                text = when {
+                                    content is LoadedBookContent.VisualPaged && !settings.pdfReflowMode ->
+                                        "Page ${state.currentPageIndex + 1} of ${content.pageCount}"
+                                    measuredTotalPages > 0 ->
+                                        "Page $measuredBookPage of $measuredTotalPages  •  Ch. ${state.currentChapterIndex + 1}/${state.activeReflowChapters.size.coerceAtLeast(1)}"
+                                    else ->
+                                        "Chapter ${state.currentChapterIndex + 1} of ${state.activeReflowChapters.size.coerceAtLeast(1)}"
                                 },
                                 style = MaterialTheme.typography.labelMedium
                             )

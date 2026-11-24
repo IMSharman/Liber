@@ -23,7 +23,9 @@ class AppContainer(application: Application) {
         db = database,
         sandboxManager = sandboxManager,
         parserDispatcher = parserDispatcher,
-        folderScanner = folderScanner
+        folderScanner = folderScanner,
+        openLibraryService = openLibraryService,
+        preferencesRepository = preferencesRepository
     )
 
     val backupAndSyncManager = BackupAndSyncManager(

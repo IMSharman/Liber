@@ -5,6 +5,7 @@ import android.net.Uri
 import android.util.LruCache
 import com.imsharman.liber.data.storage.InternalSandboxManager
 import com.imsharman.liber.domain.model.BookFormat
+import com.imsharman.liber.domain.util.BookMetadataNormalizer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -31,7 +32,7 @@ class BookParserDispatcher(
         format: BookFormat
     ): ParsedBookMetadata = withContext(Dispatchers.IO) {
         val fallbackTitle = cleanTitleFromFileName(fileName)
-        runCatching {
+        val rawMeta = runCatching {
             when (format) {
                 BookFormat.EPUB -> openStream(uri)?.use {
                     EpubParser.parseMetadataOnly(it, fallbackTitle)
@@ -57,6 +58,27 @@ class BookParserDispatcher(
         }.getOrElse {
             ParsedBookMetadata(title = fallbackTitle)
         }
+
+        val normalizedAuthor = BookMetadataNormalizer.normalizeAuthor(rawMeta.author)
+        var seriesName = BookMetadataNormalizer.normalizeSeriesName(rawMeta.seriesName)
+        var seriesIndex = rawMeta.seriesIndex
+        if (seriesName == null) {
+            val inferred = BookMetadataNormalizer.inferSeriesFromBookSignals(
+                title = rawMeta.title,
+                fileName = fileName,
+                description = rawMeta.description
+            )
+            if (inferred != null) {
+                seriesName = inferred.seriesName
+                if (seriesIndex == null) seriesIndex = inferred.seriesIndex
+            }
+        }
+        rawMeta.copy(
+            title = BookMetadataNormalizer.cleanBookTitle(rawMeta.title),
+            author = normalizedAuthor,
+            seriesName = seriesName,
+            seriesIndex = seriesIndex
+        )
     }
 
     suspend fun loadBookContent(
